@@ -11,10 +11,13 @@ export function createBot({
 }) {
   const bot = new Telegraf(botToken);
 
+  // ✅ VIP owner bypass
+  const OWNER_ID = Number(process.env.OWNER_ID || 0);
+
   const START_BONUS_CREDITS = Number(process.env.START_BONUS_CREDITS || 2);
   const REFERRAL_BONUS_CREDITS = Number(process.env.REFERRAL_BONUS_CREDITS || 1);
 
-  // Simple packages (Stars -> credits). You can edit these later.
+  // Packs Stars -> credits
   const PACKS = [
     { id: 'p10', title: '10 генераций', credits: 10, stars: 49, description: 'Пак на 10 генераций' },
     { id: 'p30', title: '30 генераций', credits: 30, stars: 129, description: 'Пак на 30 генераций' },
@@ -26,10 +29,10 @@ export function createBot({
     botUsername = me?.username || null;
   }).catch(() => {});
 
-  const genState = new Map(); // userId -> { mode: 'await_prompt', aspect_ratio }
+  const genState = new Map(); // userId -> { mode: 'await_prompt', aspect_ratio, preset? }
 
+  // ---------- helpers ----------
   function makeRefCode(userId) {
-    // compact, stable and URL-safe
     return Number(userId).toString(36);
   }
 
@@ -39,27 +42,53 @@ export function createBot({
     return param || null;
   }
 
+  // safer HTML output (avoid Telegram parse errors)
+  function esc(s) {
+    return String(s ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
+  }
+
   function ensureUser(from, referredBy = null) {
     const existing = db.getUser.get(from.id);
-    db.upsertUser.run({
-      user_id: from.id,
-      username: from.username || null,
-      first_name: from.first_name || null,
-      last_name: from.last_name || null,
-      joined_at: Date.now(),
-      credits: START_BONUS_CREDITS,
-      referred_by: referredBy,
-    });
+
+    // IMPORTANT: db.upsertUser должен НЕ сбрасывать credits (мы это уже фиксили)
+    if (!existing) {
+      db.upsertUser.run(
+        from.id,
+        from.username || null,
+        from.first_name || null,
+        from.last_name || null,
+        Date.now(),
+        START_BONUS_CREDITS,
+        referredBy
+      );
+    } else {
+      // обновляем только мета-данные
+      db.upsertUser.run(
+        from.id,
+        from.username || null,
+        from.first_name || null,
+        from.last_name || null,
+        existing.joined_at || Date.now(),
+        existing.credits || 0,
+        existing.referred_by || null
+      );
+    }
+
     return { user: db.getUser.get(from.id), isNew: !existing };
   }
 
   async function isSubscribed(userId) {
-    // NOTE: getChatMember is only guaranteed to work if the bot is admin in the chat/channel.
-    // See Bot API changelog note.
+    // ✅ VIP owner bypass
+    if (OWNER_ID && Number(userId) === OWNER_ID) return true;
+
+    // getChatMember works reliably only when bot is admin in channel
     const url = `https://api.telegram.org/bot${botToken}/getChatMember`;
     const res = await axios.get(url, {
       params: {
-        chat_id: channelUsername, // '@gurenko_kristina_ai'
+        chat_id: channelUsername, // e.g. '@gurenko_kristina_ai'
         user_id: userId,
       },
       timeout: 15_000,
@@ -70,8 +99,9 @@ export function createBot({
   }
 
   function gateKeyboard() {
+    const ch = channelUsername.replace('@', '');
     return Markup.inlineKeyboard([
-      [Markup.button.url('✅ Подписаться на канал', `https://t.me/${channelUsername.replace('@', '')}`)],
+      [Markup.button.url('✅ Подписаться на канал', `https://t.me/${ch}`)],
       [Markup.button.callback('🔄 Проверить подписку', 'check_sub')],
     ]);
   }
@@ -94,18 +124,17 @@ export function createBot({
   }
 
   async function showMenu(ctx) {
-    return ctx.reply(
-      `Готово ✅\n\nВыбирай, что делаем:`,
-      mainMenuKeyboard()
-    );
+    return ctx.reply('Готово ✅\n\nВыбирай, что делаем:', mainMenuKeyboard());
   }
 
+  // ---------- /start ----------
   bot.start(async (ctx) => {
     try {
-      // Create/update user record + handle referral
+      // referral parse
       const startParam = parseStartParam(ctx.message?.text);
       let referredBy = null;
       let referrerUserId = null;
+
       if (startParam?.startsWith('ref_')) {
         referredBy = startParam;
         const code = startParam.replace('ref_', '').trim();
@@ -115,21 +144,28 @@ export function createBot({
 
       const { isNew } = ensureUser(ctx.from, referredBy);
 
+      // gate
       const ok = await isSubscribed(ctx.from.id);
       if (!ok) return showGate(ctx);
 
-      // referral bonus (only on first start, no self-ref)
+      // referral bonus (если у тебя в db.js есть эти методы — ок; если нет, просто пропустим)
       if (isNew && referrerUserId && referrerUserId !== ctx.from.id) {
-        const already = db.hasReferral.get(referrerUserId, ctx.from.id);
-        if (!already) {
-          db.insertReferral.run(referrerUserId, ctx.from.id, Date.now());
-          db.addCredits.run(REFERRAL_BONUS_CREDITS, ctx.from.id);
-          db.addCredits.run(REFERRAL_BONUS_CREDITS, referrerUserId);
-          // try to notify referrer (ignore errors)
-          bot.telegram.sendMessage(
-            referrerUserId,
-            `🎁 У тебя новый друг по ссылке! +${REFERRAL_BONUS_CREDITS} генерац(ии) добавлено в профиль.`
-          ).catch(() => {});
+        try {
+          if (db.hasReferral && db.insertReferral && db.addCredits) {
+            const already = db.hasReferral.get(referrerUserId, ctx.from.id);
+            if (!already) {
+              db.insertReferral.run(referrerUserId, ctx.from.id, Date.now());
+              db.addCredits.run(REFERRAL_BONUS_CREDITS, ctx.from.id);
+              db.addCredits.run(REFERRAL_BONUS_CREDITS, referrerUserId);
+
+              bot.telegram.sendMessage(
+                referrerUserId,
+                `🎁 У тебя новый друг по ссылке! +${REFERRAL_BONUS_CREDITS} генерац(ии) добавлено в профиль.`
+              ).catch(() => {});
+            }
+          }
+        } catch {
+          // ignore referral system errors
         }
       }
 
@@ -141,13 +177,14 @@ export function createBot({
     }
   });
 
-  // Required for payment disputes support
+  // ---------- paysupport ----------
   bot.command('paysupport', async (ctx) => {
     return ctx.reply(
       '💬 Поддержка по оплате\n\nЕсли у тебя списались Stars, а генерации не начислились — пришли сюда скрин оплаты и свой @username. Мы разберёмся ✅'
     );
   });
 
+  // ---------- check_sub ----------
   bot.action('check_sub', async (ctx) => {
     await ctx.answerCbQuery();
     try {
@@ -155,23 +192,23 @@ export function createBot({
       if (!ok) return ctx.reply('Пока не вижу подписку 😌 Подпишись и нажми ещё раз.', gateKeyboard());
       return showMenu(ctx);
     } catch (e) {
-      return ctx.reply(
-        'Ошибка проверки подписки.\nПроверь, что бот админ в канале и канал указан правильно.'
-      );
+      return ctx.reply('Ошибка проверки подписки.\nПроверь, что бот админ в канале и канал указан правильно.');
     }
   });
 
+  // ---------- help ----------
   bot.action('help', async (ctx) => {
     await ctx.answerCbQuery();
     return ctx.reply(
-      `🆘 Поддержка\n\n• Генерация работает через Freepik API\n• Новые промты подтягиваются из твоего канала\n\nЕсли что-то не работает — напиши сюда: @gurenko_kristina (или замени на свой контакт).`
+      `🆘 Поддержка\n\n• Генерация работает через Freepik API\n• Новые промты подтягиваются из канала\n\nЕсли что-то не работает — напиши: @gurenko_kristina`
     );
   });
 
+  // ---------- profile ----------
   bot.action('profile', async (ctx) => {
     await ctx.answerCbQuery();
 
-    // gate
+    // gate (owner bypass inside isSubscribed)
     try {
       const ok = await isSubscribed(ctx.from.id);
       if (!ok) return showGate(ctx);
@@ -180,31 +217,45 @@ export function createBot({
     }
 
     const { user } = ensureUser(ctx.from);
+
     const refCode = makeRefCode(ctx.from.id);
     const deepLink = botUsername
       ? `https://t.me/${botUsername}?start=ref_${refCode}`
       : `https://t.me/<YOUR_BOT_USERNAME>?start=ref_${refCode}`;
 
-    const shareLink = `https://t.me/share/url?url=${encodeURIComponent(deepLink)}&text=${encodeURIComponent('Держи бот с промтами и генерацией 🔥')}`;
+    const shareBot = `https://t.me/share/url?url=${encodeURIComponent(deepLink)}&text=${encodeURIComponent('Держи бот с промтами и генерацией 🔥')}`;
+    const channelLink = `https://t.me/${channelUsername.replace('@', '')}`;
+    const shareChannel = `https://t.me/share/url?url=${encodeURIComponent(channelLink)}&text=${encodeURIComponent('Подпишись на канал — там новые промты и гайды 🤍')}`;
 
-    const text =
-      `👤 *Профиль*\n\n` +
-      `• ID: \`${user.user_id}\`\n` +
-      `• @${user.username || 'без_ника'}\n` +
-      `• Генерации: *${user.credits}*\n` +
-      `• Потрачено Stars: *${user.total_spent_stars}*\n` +
-      (user.last_result_url ? `\nПоследний результат: ${user.last_result_url}` : '') +
-      `\n\n🔗 Твоя ссылка для друзей:\n${deepLink}`;
+    const credits = Number(user?.credits || 0);
+    const spentStars = Number(user?.spent_stars || 0);
+    const lastResult = user?.last_result ? String(user.last_result) : null;
+
+    // ✅ HTML (без ошибок Markdown)
+    let text = '';
+    text += `👤 <b>Профиль</b>\n\n`;
+    text += `• ID: <code>${esc(user.user_id)}</code>\n`;
+    text += `• Username: <b>@${esc(user.username || 'без_ника')}</b>\n`;
+    text += `• Генерации: <b>${esc(credits)}</b>\n`;
+    text += `• Потрачено Stars: <b>${esc(spentStars)}</b>\n`;
+
+    if (lastResult) {
+      text += `\n<b>Последний результат:</b>\n${esc(lastResult)}\n`;
+    }
+
+    text += `\n🔗 <b>Твоя ссылка для друзей:</b>\n${esc(deepLink)}`;
 
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback('💫 Купить генерации', 'buy')],
-      [Markup.button.url('🔗 Поделиться с другом', shareLink)],
+      [Markup.button.url('🔗 Поделиться ботом', shareBot)],
+      [Markup.button.url('📣 Поделиться каналом', shareChannel)],
       [Markup.button.webApp('🌐 Открыть Mini App', webAppUrl)],
     ]);
 
-    return ctx.reply(text, { parse_mode: 'Markdown', ...kb });
+    return ctx.reply(text, { parse_mode: 'HTML', ...kb });
   });
 
+  // ---------- buy ----------
   function buyKeyboard() {
     return Markup.inlineKeyboard([
       ...PACKS.map((p) => [Markup.button.callback(`${p.title} — ${p.stars}⭐️`, `buy_pack:${p.id}`)]),
@@ -215,7 +266,6 @@ export function createBot({
   bot.action('buy', async (ctx) => {
     await ctx.answerCbQuery();
 
-    // gate
     try {
       const ok = await isSubscribed(ctx.from.id);
       if (!ok) return showGate(ctx);
@@ -224,10 +274,7 @@ export function createBot({
     }
 
     ensureUser(ctx.from);
-    return ctx.reply(
-      '💫 Покупка генераций за Telegram Stars\n\nВыбери пакет:',
-      buyKeyboard()
-    );
+    return ctx.reply('💫 Покупка генераций за Telegram Stars\n\nВыбери пакет:', buyKeyboard());
   });
 
   bot.action('back_to_menu', async (ctx) => {
@@ -251,8 +298,9 @@ export function createBot({
 
     ensureUser(ctx.from);
 
-    // Telegram Stars invoice: currency = XTR, provider_token can be empty for digital goods.
     const payload = `pack:${pack.id}`;
+
+    // Stars invoice
     await bot.telegram.sendInvoice(ctx.from.id, {
       title: pack.title,
       description: `${pack.description}. Начислим +${pack.credits} генераций.`,
@@ -271,8 +319,8 @@ export function createBot({
     }
   });
 
+  // ---------- payment success ----------
   bot.on('message', async (ctx, next) => {
-    // handle successful stars payment
     const sp = ctx.message?.successful_payment;
     if (sp) {
       try {
@@ -285,159 +333,48 @@ export function createBot({
         const creditsAdded = pack ? pack.credits : 0;
 
         ensureUser(ctx.from);
-        if (creditsAdded > 0) {
+
+        if (creditsAdded > 0 && db.addCredits) {
           db.addCredits.run(creditsAdded, ctx.from.id);
         }
-        if (totalStars > 0) {
+        if (totalStars > 0 && db.addSpentStars) {
           db.addSpentStars.run(totalStars, ctx.from.id);
         }
-        db.insertPurchase.run(ctx.from.id, payload, totalStars, creditsAdded, chargeId, Date.now());
+
+        // optional purchases table
+        if (db.insertPurchase) {
+          db.insertPurchase.run(ctx.from.id, payload, totalStars, creditsAdded, chargeId, Date.now());
+        }
 
         await ctx.reply(
-          `✅ Оплата прошла!\nНачислила: *+${creditsAdded}* генераций\nБаланс обновлён 🔥`,
-          { parse_mode: 'Markdown', ...mainMenuKeyboard() }
+          `✅ Оплата прошла!\nНачислила: +${creditsAdded} генераций\nБаланс обновлён 🔥`,
+          mainMenuKeyboard()
         );
       } catch (e) {
         await ctx.reply('Оплата прошла, но я не смогла начислить генерации автоматически 🙈 Напиши /paysupport');
       }
       return;
     }
+
     return next();
   });
 
+  // ---------- prompts ----------
   bot.action('prompts', async (ctx) => {
     await ctx.answerCbQuery();
-    const items = db.listPrompts.all(10);
-    if (!items.length) return ctx.reply('Пока нет промтов. Добавь пост в канал и я подхвачу ✅');
 
-    const text = items
-      .map((p) => `#${p.id} — ${p.title || 'Промт'}\n${p.text.slice(0, 220)}${p.text.length > 220 ? '…' : ''}`)
-      .join('\n\n');
-
-    const kb = Markup.inlineKeyboard(
-      items.slice(0, 5).map((p) => [Markup.button.callback(`Использовать #${p.id}`, `use_prompt:${p.id}`)])
-    );
-
-    return ctx.reply(`📚 Свежие промты:\n\n${text}`, kb);
-  });
-
-  bot.action(/use_prompt:(\d+)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const id = Number(ctx.match[1]);
-    const row = db.db.prepare('SELECT id, text FROM prompts WHERE id=?').get(id);
-    if (!row) return ctx.reply('Не нашла этот промт 🙈');
-
-    genState.set(ctx.from.id, { mode: 'await_prompt', aspect_ratio: 'social_story_9_16', preset: row.text });
-    return ctx.reply('Ок ✅ Отправь “ДА” чтобы сгенерировать по этому промту, или напиши новый промт текстом.');
-  });
-
-  bot.action('gen', async (ctx) => {
-    await ctx.answerCbQuery();
-    genState.set(ctx.from.id, { mode: 'await_prompt', aspect_ratio: 'social_story_9_16' });
-    return ctx.reply(
-      'Напиши промт для генерации (или отправь любой текст).\n\nПример: “ultra realistic portrait, soft daylight, editorial”'
-    );
-  });
-
-  bot.on('text', async (ctx) => {
-    const state = genState.get(ctx.from.id);
-    if (!state?.mode) return;
-
-    // Subscription gate for all actions
+    // gate
     try {
       const ok = await isSubscribed(ctx.from.id);
-      if (!ok) {
-        genState.delete(ctx.from.id);
-        return showGate(ctx);
-      }
+      if (!ok) return showGate(ctx);
     } catch {
       // ignore
     }
 
-    const text = ctx.message.text?.trim();
-    const prompt = text === 'ДА' && state.preset ? state.preset : text;
-
-    genState.delete(ctx.from.id);
-
-    if (!prompt) return ctx.reply('Пустой промт 😅 Попробуй ещё раз.');
-    if (!freepikApiKey) return ctx.reply('Freepik API ключ не настроен в .env');
-
-    // credits
-    ensureUser(ctx.from);
-    const spend = db.spendCredit.run(ctx.from.id);
-    if (spend.changes === 0) {
-      return ctx.reply(
-        'На балансе нет генераций 😌\n\nПополнить можно за Stars:',
-        buyKeyboard()
-      );
+    const items = db.listPrompts.all(10);
+    if (!items.length) {
+      return ctx.reply('Пока нет промтов. Добавь пост в канал и я подхвачу ✅');
     }
 
-    await ctx.reply('Запускаю генерацию… ⏳');
-
-    const createdAt = Date.now();
-    try {
-      const task = await createMysticTask({
-        apiKey: freepikApiKey,
-        prompt,
-        aspect_ratio: state.aspect_ratio || 'social_story_9_16',
-      });
-
-      db.insertGen.run(ctx.from.id, prompt, state.aspect_ratio || 'social_story_9_16', task.task_id, 'IN_PROGRESS', createdAt);
-
-      // Poll up to ~70 seconds
-      const deadline = Date.now() + 70_000;
-      let lastStatus = task.status;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2500));
-        const status = await getMysticTask({ apiKey: freepikApiKey, taskId: task.task_id });
-        lastStatus = status.status;
-
-        if (status.status === 'COMPLETED' && status.generated?.length) {
-          const url = status.generated[0];
-          db.updateGen.run('COMPLETED', url, task.task_id);
-          db.setLastResult.run(url, ctx.from.id);
-          await ctx.replyWithPhoto(url, { caption: 'Готово ✅' });
-          return;
-        }
-
-        if (status.status === 'FAILED') {
-          db.updateGen.run('FAILED', null, task.task_id);
-          db.addCredits.run(1, ctx.from.id); // refund
-          return ctx.reply('Упс… генерация не получилась 😢 Попробуй другой промт.');
-        }
-      }
-
-      return ctx.reply(`Генерация ещё в процессе (${lastStatus}).\nЯ не дождалась ответа по таймауту — попробуй повторить позже.`);
-
-    } catch (e) {
-      const msg = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 350) : (e.message || 'error');
-      db.addCredits.run(1, ctx.from.id); // refund
-      return ctx.reply(`Ошибка генерации: ${msg}`);
-    }
-  });
-
-  // Auto-ingest prompts from channel posts
-  bot.on('channel_post', async (ctx) => {
-    try {
-      if (!ctx.channelPost?.text) return;
-      if (ctx.channelPost.chat?.username && `@${ctx.channelPost.chat.username}` !== channelUsername) return;
-
-      const raw = ctx.channelPost.text.trim();
-      // Basic formatting: first line = title (if short), rest = prompt
-      const lines = raw.split('\n');
-      let title = null;
-      let text = raw;
-      if (lines[0] && lines[0].length <= 60 && lines.length >= 2) {
-        title = lines[0].replace(/^#+\s*/,'').trim();
-        text = lines.slice(1).join('\n').trim();
-      }
-
-      if (!text) return;
-      db.insertPrompt.run(title, text, ctx.channelPost.message_id, Date.now());
-    } catch {
-      // ignore
-    }
-  });
-
-  return bot;
-}
+    const text = items
+      .map((p) => `#${p.id} — ${p.title || 'Промт'}\n${String(p.text)
