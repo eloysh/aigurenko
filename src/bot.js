@@ -377,4 +377,165 @@ export function createBot({
     }
 
     const text = items
-      .map((p) => `#${p.id} — ${p.title || 'Промт'}\n${String(p.text)
+      .map((p) => `#${p.id} — ${p.title || 'Промт'}\n${String(p.text).slice(0, 220)}${String(p.text).length > 220 ? '…' : ''}`)
+      .join('\n\n');
+
+    const kb = Markup.inlineKeyboard(
+      items.slice(0, 5).map((p) => [Markup.button.callback(`Использовать #${p.id}`, `use_prompt:${p.id}`)])
+    );
+
+    return ctx.reply(`📚 Свежие промты:\n\n${text}`, kb);
+  });
+
+  bot.action(/use_prompt:(\d+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+
+    // gate
+    try {
+      const ok = await isSubscribed(ctx.from.id);
+      if (!ok) return showGate(ctx);
+    } catch {
+      // ignore
+    }
+
+    const id = Number(ctx.match[1]);
+    const row = db.db.prepare('SELECT id, text FROM prompts WHERE id=?').get(id);
+    if (!row) return ctx.reply('Не нашла этот промт 🙈');
+
+    genState.set(ctx.from.id, { mode: 'await_prompt', aspect_ratio: 'social_story_9_16', preset: row.text });
+    return ctx.reply('Ок ✅ Отправь “ДА” чтобы сгенерировать по этому промту, или напиши новый промт текстом.');
+  });
+
+  // ---------- gen ----------
+  bot.action('gen', async (ctx) => {
+    await ctx.answerCbQuery();
+
+    // gate
+    try {
+      const ok = await isSubscribed(ctx.from.id);
+      if (!ok) return showGate(ctx);
+    } catch {
+      // ignore
+    }
+
+    genState.set(ctx.from.id, { mode: 'await_prompt', aspect_ratio: 'social_story_9_16' });
+    return ctx.reply('Напиши промт для генерации (или отправь любой текст).\n\nПример: “ultra realistic portrait, soft daylight, editorial”');
+  });
+
+  // ---------- handle text -> generate ----------
+  bot.on('text', async (ctx) => {
+    const state = genState.get(ctx.from.id);
+    if (!state?.mode) return;
+
+    // gate
+    try {
+      const ok = await isSubscribed(ctx.from.id);
+      if (!ok) {
+        genState.delete(ctx.from.id);
+        return showGate(ctx);
+      }
+    } catch {
+      // ignore
+    }
+
+    const text = ctx.message.text?.trim();
+    const prompt = text === 'ДА' && state.preset ? state.preset : text;
+
+    genState.delete(ctx.from.id);
+
+    if (!prompt) return ctx.reply('Пустой промт 😅 Попробуй ещё раз.');
+    if (!freepikApiKey) return ctx.reply('Freepik API ключ не настроен в .env');
+
+    ensureUser(ctx.from);
+    const spend = db.spendCredit.run(ctx.from.id);
+    if (spend.changes === 0) {
+      return ctx.reply('На балансе нет генераций 😌\n\nПополнить можно за Stars:', buyKeyboard());
+    }
+
+    await ctx.reply('Запускаю генерацию… ⏳');
+
+    const createdAt = Date.now();
+
+    try {
+      const task = await createMysticTask({
+        apiKey: freepikApiKey,
+        prompt,
+        aspect_ratio: state.aspect_ratio || 'social_story_9_16',
+      });
+
+      db.insertGen.run(
+        ctx.from.id,
+        prompt,
+        state.aspect_ratio || 'social_story_9_16',
+        task.task_id,
+        'IN_PROGRESS',
+        createdAt
+      );
+
+      // Poll up to ~70 seconds
+      const deadline = Date.now() + 70_000;
+      let lastStatus = task.status;
+
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2500));
+        const status = await getMysticTask({ apiKey: freepikApiKey, taskId: task.task_id });
+        lastStatus = status.status;
+
+        if (status.status === 'COMPLETED' && status.generated?.length) {
+          const url = status.generated[0];
+          db.updateGen.run('COMPLETED', url, task.task_id);
+          db.setLastResult.run(url, ctx.from.id);
+
+          await ctx.replyWithPhoto(url, { caption: 'Готово ✅' });
+          return;
+        }
+
+        if (status.status === 'FAILED') {
+          db.updateGen.run('FAILED', null, task.task_id);
+          db.addCredits.run(1, ctx.from.id); // refund
+          return ctx.reply('Упс… генерация не получилась 😢 Попробуй другой промт.');
+        }
+      }
+
+      return ctx.reply(`Генерация ещё в процессе (${lastStatus}).\nЯ не дождалась ответа по таймауту — попробуй повторить позже.`);
+    } catch (e) {
+      const msg = e?.response?.data ? JSON.stringify(e.response.data).slice(0, 350) : (e.message || 'error');
+      db.addCredits.run(1, ctx.from.id); // refund
+      return ctx.reply(`Ошибка генерации: ${msg}`);
+    }
+  });
+
+  // ---------- auto ingest prompts from channel ----------
+  bot.on('channel_post', async (ctx) => {
+    try {
+      const post = ctx.channelPost;
+      if (!post?.text) return;
+
+      // accept only from your channel
+      const uname = post.chat?.username ? `@${post.chat.username}` : null;
+      if (uname && uname !== channelUsername) return;
+
+      const raw = post.text.trim();
+      if (!raw) return;
+
+      // first line = title (if short), rest = prompt text
+      const lines = raw.split('\n');
+      let title = null;
+      let text = raw;
+
+      if (lines[0] && lines[0].length <= 60 && lines.length >= 2) {
+        title = lines[0].replace(/^#+\s*/, '').trim();
+        text = lines.slice(1).join('\n').trim();
+      }
+
+      if (!text) return;
+
+      // ✅ FIX: insertPrompt expects (title, text, created_at)
+      db.insertPrompt.run(title, text, Date.now());
+    } catch {
+      // ignore
+    }
+  });
+
+  return bot;
+}
