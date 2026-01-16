@@ -1,150 +1,155 @@
-import Database from 'better-sqlite3';
 import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
 
+/**
+ * SQLite helper + prepared statements.
+ * FIX:
+ *  - используем '' (одинарные кавычки) для строк в SQL
+ *  - создаём папку для SQLITE_PATH если её нет
+ *  - upsertUser НЕ сбрасывает кредиты
+ */
 export function initDb(sqlitePath = "./data.sqlite") {
+  // ✅ создаём папку под базу если путь вида /var/data/data.sqlite
   const dir = path.dirname(sqlitePath);
   if (dir && dir !== "." && !fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
 
   const db = new Database(sqlitePath);
-  ...
-}
-export function initDb(dbPath = './data.sqlite') {
-  const db = new Database(dbPath);
 
+  // Good defaults
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+
+  // ---------- schema ----------
   db.exec(`
-    PRAGMA journal_mode=WAL;
-
     CREATE TABLE IF NOT EXISTS users (
-      user_id INTEGER PRIMARY KEY,
-      username TEXT,
-      first_name TEXT,
-      last_name TEXT,
-      joined_at INTEGER NOT NULL,
-      credits INTEGER NOT NULL DEFAULT 0,
-      total_spent_stars INTEGER NOT NULL DEFAULT 0,
-      last_result_url TEXT,
-      referred_by TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS referrals (
-      referrer_user_id INTEGER NOT NULL,
-      referred_user_id INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      UNIQUE(referrer_user_id, referred_user_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS purchases (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      payload TEXT NOT NULL,
-      stars INTEGER NOT NULL,
-      credits_added INTEGER NOT NULL,
-      telegram_charge_id TEXT,
-      created_at INTEGER NOT NULL
+      user_id       INTEGER PRIMARY KEY,
+      username      TEXT,
+      first_name    TEXT,
+      last_name     TEXT,
+      joined_at     INTEGER,
+      credits       INTEGER NOT NULL DEFAULT 0,
+      spent_stars   INTEGER NOT NULL DEFAULT 0,
+      referred_by   TEXT,
+      last_result   TEXT
     );
 
     CREATE TABLE IF NOT EXISTS prompts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT,
-      text TEXT NOT NULL,
-      source_message_id INTEGER,
-      created_at INTEGER NOT NULL
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      title        TEXT,
+      text         TEXT NOT NULL,
+      created_at   INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS generations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      prompt TEXT NOT NULL,
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id      INTEGER NOT NULL,
+      prompt       TEXT NOT NULL,
       aspect_ratio TEXT NOT NULL,
-      task_id TEXT,
-      result_url TEXT,
-      status TEXT NOT NULL,
-      created_at INTEGER NOT NULL
+      task_id      TEXT,
+      status       TEXT NOT NULL,
+      url          TEXT,
+      created_at   INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
     );
   `);
 
-  // Users
-  const upsertUser = db.prepare(
-    `INSERT INTO users(user_id, username, first_name, last_name, joined_at, credits, referred_by)
-     VALUES (@user_id, @username, @first_name, @last_name, @joined_at, @credits, @referred_by)
-     ON CONFLICT(user_id) DO UPDATE SET
-       username=COALESCE(excluded.username, users.username),
-       first_name=COALESCE(excluded.first_name, users.first_name),
-       last_name=COALESCE(excluded.last_name, users.last_name)
-    `
-  );
+  // ---------- prepared statements ----------
+  const stmts = {
+    // USERS
+    getUser: db.prepare(`SELECT * FROM users WHERE user_id = ?`),
 
-  const getUser = db.prepare(
-    'SELECT user_id, username, first_name, last_name, joined_at, credits, total_spent_stars, last_result_url, referred_by FROM users WHERE user_id=?'
-  );
+    /**
+     * Важно:
+     * - создаёт пользователя если его нет
+     * - обновляет только username/first_name/last_name если есть
+     * - НЕ сбрасывает credits/spent_stars
+     */
+    upsertUser: db.prepare(`
+      INSERT INTO users (
+        user_id, username, first_name, last_name, joined_at, credits, referred_by
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        username   = excluded.username,
+        first_name = excluded.first_name,
+        last_name  = excluded.last_name
+    `),
 
-  const addCredits = db.prepare(
-    'UPDATE users SET credits = credits + ? WHERE user_id=?'
-  );
+    spendCredit: db.prepare(`
+      UPDATE users
+      SET credits = credits - 1
+      WHERE user_id = ? AND credits > 0
+    `),
 
-  const spendCredit = db.prepare(
-    'UPDATE users SET credits = credits - 1 WHERE user_id=? AND credits > 0'
-  );
+    addCredits: db.prepare(`
+      UPDATE users
+      SET credits = credits + ?
+      WHERE user_id = ?
+    `),
 
-  const setLastResult = db.prepare(
-    'UPDATE users SET last_result_url=? WHERE user_id=?'
-  );
+    addSpentStars: db.prepare(`
+      UPDATE users
+      SET spent_stars = spent_stars + ?
+      WHERE user_id = ?
+    `),
 
-  const addSpentStars = db.prepare(
-    'UPDATE users SET total_spent_stars = total_spent_stars + ? WHERE user_id=?'
-  );
+    setLastResult: db.prepare(`
+      UPDATE users
+      SET last_result = ?
+      WHERE user_id = ?
+    `),
 
-  const insertReferral = db.prepare(
-    'INSERT OR IGNORE INTO referrals(referrer_user_id, referred_user_id, created_at) VALUES (?, ?, ?)'
-  );
+    // PROMPTS
+    insertPrompt: db.prepare(`
+      INSERT INTO prompts (title, text, created_at)
+      VALUES (?, ?, ?)
+    `),
 
-  const hasReferral = db.prepare(
-    'SELECT 1 FROM referrals WHERE referrer_user_id=? AND referred_user_id=?'
-  );
+    // ✅ FIX: '' вместо ""
+    listPrompts: db.prepare(`
+      SELECT
+        id,
+        COALESCE(title, '') AS title,
+        text,
+        created_at
+      FROM prompts
+      ORDER BY id DESC
+      LIMIT ?
+    `),
 
-  const insertPurchase = db.prepare(
-    'INSERT INTO purchases(user_id, payload, stars, credits_added, telegram_charge_id, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-  );
+    // GENERATIONS / HISTORY
+    insertGen: db.prepare(`
+      INSERT INTO generations (user_id, prompt, aspect_ratio, task_id, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `),
 
-  const insertPrompt = db.prepare(
-    'INSERT INTO prompts(title, text, source_message_id, created_at) VALUES (?, ?, ?, ?)'
-  );
+    updateGen: db.prepare(`
+      UPDATE generations
+      SET status = ?, url = ?
+      WHERE task_id = ?
+    `),
 
-  const listPrompts = db.prepare(
-    'SELECT id, COALESCE(title, "") as title, text, created_at FROM prompts ORDER BY id DESC LIMIT ?'
-  );
+    listHistory: db.prepare(`
+      SELECT id, prompt, status, url, created_at
+      FROM generations
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT ?
+    `),
+  };
 
-  const insertGen = db.prepare(
-    'INSERT INTO generations(user_id, prompt, aspect_ratio, task_id, status, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-  );
-
-  const updateGen = db.prepare(
-    'UPDATE generations SET status=?, result_url=? WHERE task_id=?'
-  );
-
-  const listHistory = db.prepare(
-    'SELECT id, prompt, aspect_ratio, result_url, status, created_at FROM generations WHERE user_id=? ORDER BY id DESC LIMIT ?'
-  );
+  const insertPromptsBatch = db.transaction((rows) => {
+    for (const r of rows) {
+      stmts.insertPrompt.run(r.title ?? null, r.text, r.created_at ?? Date.now());
+    }
+  });
 
   return {
     db,
-    upsertUser,
-    getUser,
-    addCredits,
-    spendCredit,
-    setLastResult,
-    addSpentStars,
-    insertReferral,
-    hasReferral,
-    insertPurchase,
-    insertPrompt,
-    listPrompts,
-    insertGen,
-    updateGen,
-    listHistory,
+    ...stmts,
+    insertPromptsBatch,
   };
 }
