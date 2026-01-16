@@ -17,7 +17,7 @@ const FREEPIK_API_KEY = process.env.FREEPIK_API_KEY || '';
 const BOT_USERNAME = process.env.BOT_USERNAME || '';
 const OWNER_ID = Number(process.env.OWNER_ID || 0);
 
-const BASE_URL = process.env.BASE_URL || ''; // например: https://gurenko-ai.onrender.com
+const BASE_URL = process.env.BASE_URL || ''; // например: https://aigurenko.onrender.com
 const USE_WEBHOOK = (process.env.USE_WEBHOOK || '1') !== '0';
 const WEBHOOK_PATH = process.env.WEBHOOK_PATH || '/telegram';
 
@@ -51,6 +51,9 @@ app.use('/miniapp', express.static(webappDir));
 
 const ENABLE_CHANNEL_GATE = process.env.ENABLE_CHANNEL_GATE !== '0';
 
+// ✅ чтобы главная ссылка не была "Cannot GET /"
+app.get('/', (req, res) => res.redirect('/miniapp'));
+
 // ---------- subscription check ----------
 async function isSubscribed(userId) {
   // ✅ владелица всегда проходит
@@ -66,7 +69,7 @@ async function isSubscribed(userId) {
   return ['member', 'administrator', 'creator'].includes(status);
 }
 
-// ---------- auth middleware (ONE time!) ----------
+// ---------- auth middleware ----------
 async function requireTelegramAuth(req, res, next) {
   const initData = req.header('X-Telegram-InitData') || '';
   const ok = validateInitData(initData, BOT_TOKEN);
@@ -96,7 +99,6 @@ function ensureUserFromTg(tgUser) {
 
   const existing = db.getUser.get(tgUser.id);
 
-  // НЕ сбрасываем кредиты на каждом запросе!
   db.upsertUser.run({
     user_id: tgUser.id,
     username: tgUser.username || null,
@@ -244,12 +246,17 @@ app.listen(PORT, async () => {
   console.log(`✅ Web server listening on :${PORT}`);
   console.log(`✅ Mini App: /miniapp`);
 
-  // ✅ WEBHOOK mode (no 409 conflicts)
   if (USE_WEBHOOK && BASE_URL) {
     try {
       const hookUrl = `${BASE_URL}${WEBHOOK_PATH}`;
-      await bot.telegram.setWebhook(hookUrl);
-      app.use(WEBHOOK_PATH, bot.webhookCallback(WEBHOOK_PATH));
+
+      // ✅ ВАЖНО: НЕ ДУБЛИРУЕМ ПУТЬ!
+      // ❌ app.use(WEBHOOK_PATH, bot.webhookCallback(WEBHOOK_PATH))  <-- так нельзя
+      app.use(bot.webhookCallback(WEBHOOK_PATH));
+
+      // ✅ ставим webhook + чистим зависшие апдейты
+      await bot.telegram.setWebhook(hookUrl, { drop_pending_updates: true });
+
       console.log(`✅ Bot webhook enabled: ${hookUrl}`);
     } catch (e) {
       console.log('❌ Webhook setup failed, fallback to polling:', e.message);
