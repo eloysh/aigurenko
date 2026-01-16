@@ -73,16 +73,36 @@ app.get("/health", (req, res) => {
 });
 
 // ---------- Subscription check ----------
-async function isSubscribed(userId) {
-  // Works reliably only when bot is admin in the channel.
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`;
-  const res = await axios.get(url, {
-    params: { chat_id: CHANNEL_USERNAME, user_id: userId },
-    timeout: 15_000,
-  });
-  const status = res.data?.result?.status;
-  return ["member", "administrator", "creator"].includes(status);
+const OWNER_ID = Number(process.env.OWNER_ID || 0);
+
+async function requireTelegramAuth(req, res, next) {
+  const initData = req.header("X-Telegram-InitData") || "";
+  const ok = validateInitData(initData, BOT_TOKEN);
+  if (!ok.ok) return res.status(401).json({ error: "unauthorized", reason: ok.reason });
+
+  req.tg = parseInitData(initData);
+
+  const userId = req.tg?.user?.id;
+
+  // ✅ VIP: владелица проходит всегда
+  if (OWNER_ID && Number(userId) === OWNER_ID) {
+    return next();
+  }
+
+  if (userId && ENABLE_CHANNEL_GATE) {
+    try {
+      const subOk = await isSubscribed(userId);
+      if (!subOk) return res.status(403).json({ error: "not_subscribed" });
+    } catch (e) {
+      // Мягкий режим: если Telegram не дал проверить — не ломаем работу
+      // (можно сделать строго — скажи, и я дам вариант)
+    }
+  }
+
+  next();
 }
+
+
 
 // ---------- Telegram WebApp auth middleware ----------
 async function requireTelegramAuth(req, res, next) {
